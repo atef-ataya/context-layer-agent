@@ -73,9 +73,10 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
     }
   }
 
-  async processQuery(query: string, evaluateResponse: boolean = false): Promise<AgentResponse> {
+  async processQuery(query: string): Promise<AgentResponse> {
     console.log(`\n🔵 Processing query: "${query}"\n`);
 
+    // 1. RETRIEVE MEMORY
     const relevantMemories = await this.memory.search(query, 3);
     console.log(`🧠 Retrieved ${relevantMemories.length} relevant memories`);
 
@@ -83,6 +84,7 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
       ? `\n\n--- PRIOR RESEARCH CONTEXT (background only, not conversation history) ---\n${relevantMemories.map((m, i) => `[${new Date(m.timestamp).toISOString().split('T')[0]}] ${m.content}`).join('\n')}\n---`
       : '';
 
+    // 2. SELECT SKILL
     const skills = this.skillLoader.getSkillDefinitions();
     const systemPrompt = `You are a research assistant with access to specialized skills. Use the available tools to help answer queries thoroughly.${memoryContext}`;
 
@@ -93,6 +95,7 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
       },
     ];
 
+    // 3. GENERATE
     let response = await this.client.messages.create({
       model: this.model,
       max_tokens: 4096,
@@ -106,6 +109,7 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
     });
 
     const toolsUsed: string[] = [];
+    let skillName = 'none';
 
     // Execute only the first tool once, then force final response
     if (response.stop_reason === 'tool_use') {
@@ -120,6 +124,7 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
       }
 
       console.log(`⚙️ Executing skill: ${firstTool.name}`);
+      skillName = firstTool.name;
       toolsUsed.push(firstTool.name);
 
       const result = await this.skillLoader.executeSkill(firstTool.name, firstTool.input as Record<string, any>);
@@ -154,14 +159,14 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
       });
     }
 
-    const finalContent = response.content
+    let finalContent = response.content
       .filter((block): block is Anthropic.TextBlock => block.type === 'text')
       .map((block) => block.text)
       .join('\n');
 
     console.log(`\n📝 Response generated (${finalContent.length} chars)`);
 
-    // Generate brief summary for memory (2-3 sentences max)
+    // 4. STORE TO MEMORY
     const memorySummary = await this.generateMemorySummary(query, finalContent, toolsUsed);
     await this.memory.store(memorySummary, {
       query,
@@ -169,18 +174,59 @@ Format as: "Research on [topic]: [key finding 1]. [key finding 2]. [optional: ke
       timestamp: new Date().toISOString(),
     });
 
+    // 5. EVALUATE
+    let evaluation = await this.evaluator.evaluateResponse(
+      query,
+      skillName,
+      finalContent,
+      memoryContext
+    );
+    
+    console.log(`📊 Evaluation score: ${evaluation.score}/100`);
+
+    // Retry logic if score is below threshold
+    if (!evaluation.passed) {
+      console.log(`🔄 Score below threshold. Retrying with evaluator feedback...`);
+      
+      // Retry with feedback injected
+      const retryPrompt = `${query}\n\n[Evaluator feedback]: ${evaluation.feedback}`;
+      
+      messages.push({
+        role: 'user',
+        content: retryPrompt,
+      });
+
+      response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages,
+      });
+
+      finalContent = response.content
+        .filter((block): block is Anthropic.TextBlock => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+
+      // Re-evaluate the retry
+      evaluation = await this.evaluator.evaluateResponse(
+        query,
+        skillName,
+        finalContent,
+        memoryContext
+      );
+      
+      console.log(`📊 Evaluation score: ${evaluation.score}/100`);
+    }
+
+    console.log(`✅ Returning response`);
+
     const agentResponse: AgentResponse = {
       content: finalContent,
       toolsUsed,
       memoryRetrieved: relevantMemories.length,
+      evaluationScore: evaluation.score,
     };
-
-    if (evaluateResponse) {
-      const evaluation = await this.evaluator.evaluateResponse(query, finalContent);
-      agentResponse.evaluationScore = evaluation.score;
-      console.log(`📊 Evaluation: ${evaluation.score}/100`);
-      console.log(`   Reasoning: ${evaluation.reasoning}`);
-    }
 
     return agentResponse;
   }

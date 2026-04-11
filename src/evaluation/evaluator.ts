@@ -1,16 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 export interface EvaluationResult {
-  score: number;
-  reasoning: string;
-  suggestions: string[];
-}
-
-export interface EvaluationCriteria {
-  accuracy?: boolean;
-  completeness?: boolean;
-  relevance?: boolean;
-  clarity?: boolean;
+  score: number;       // 0–100
+  passed: boolean;     // score >= 70 — computed in code, not by the model
+  feedback: string;    // one sentence — what the evaluator found
+  flags: string[];     // specific issues for debugging
 }
 
 export class Evaluator {
@@ -21,87 +15,55 @@ export class Evaluator {
   }
 
   async evaluateResponse(
-    query: string,
+    task: string,
+    skill: string,
     response: string,
-    criteria: EvaluationCriteria = {}
+    memoryContext?: string
   ): Promise<EvaluationResult> {
-    const activeCriteria = {
-      accuracy: criteria.accuracy !== false,
-      completeness: criteria.completeness !== false,
-      relevance: criteria.relevance !== false,
-      clarity: criteria.clarity !== false,
-    };
+    const evalPrompt = `You are evaluating a research response.
 
-    const criteriaList = Object.entries(activeCriteria)
-      .filter(([_, enabled]) => enabled)
-      .map(([criterion]) => criterion);
+Original task: "${task}"
+Skill used: ${skill}
+Memory context provided: ${memoryContext ? 'Yes' : 'No'}
 
-    const prompt = `Evaluate the following response to a query based on these criteria: ${criteriaList.join(', ')}.
+Response to evaluate:
+"""
+${response}
+"""
 
-Query: "${query}"
+Evaluate on these criteria:
+1. Answers the actual task (0–40)
+2. Uses appropriate depth for the skill type (0–30)
+3. Makes claims with appropriate certainty markers (0–20)
+4. Integrates prior context when provided (0–10)
 
-Response: "${response}"
-
-Provide:
-1. A score from 0-100
-2. Brief reasoning for the score
-3. 2-3 specific suggestions for improvement
-
-Format your response as JSON:
-{
-  "score": <number>,
-  "reasoning": "<string>",
-  "suggestions": ["<string>", "<string>", ...]
-}`;
+Return ONLY valid JSON, no preamble, no explanation:
+{ "score": 0, "feedback": "one sentence", "flags": ["issue1"] }`;
 
     try {
-      const message = await this.client.messages.create({
+      const result = await this.client.messages.create({
         model: 'claude-opus-4-6',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
+        max_tokens: 300,
+        messages: [{ role: 'user', content: evalPrompt }]
       });
 
-      const content = message.content[0];
-      if (content.type !== 'text') {
-        throw new Error('Unexpected response type from Claude');
-      }
+      const raw = (result.content[0] as { type: 'text'; text: string }).text.trim();
+      const parsed = JSON.parse(raw);
 
-      const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No JSON found in response');
-      }
-
-      const result = JSON.parse(jsonMatch[0]) as EvaluationResult;
-      console.log(`📊 Evaluation score: ${result.score}/100`);
-      
-      return result;
+      return {
+        score: parsed.score,
+        passed: parsed.score >= 70,
+        feedback: parsed.feedback,
+        flags: parsed.flags ?? []
+      };
     } catch (error) {
-      console.error('Evaluation failed:', error);
+      console.error('❌ Evaluation failed:', error);
       return {
         score: 0,
-        reasoning: 'Evaluation failed due to an error',
-        suggestions: ['Retry evaluation', 'Check API connection'],
+        passed: false,
+        feedback: 'Evaluation failed due to an error',
+        flags: ['evaluation_error']
       };
     }
-  }
-
-  async evaluateBatch(
-    evaluations: Array<{ query: string; response: string }>
-  ): Promise<EvaluationResult[]> {
-    console.log(`📊 Evaluating batch of ${evaluations.length} responses`);
-    
-    const results = await Promise.all(
-      evaluations.map((item) => this.evaluateResponse(item.query, item.response))
-    );
-
-    const avgScore = results.reduce((sum, r) => sum + r.score, 0) / results.length;
-    console.log(`📊 Average batch score: ${avgScore.toFixed(1)}/100`);
-
-    return results;
   }
 }

@@ -47,14 +47,12 @@ async function main() {
     console.log('Context Layer Agent');
     console.log('='.repeat(80) + '\n');
 
-    const response = await agent.processQuery(task, true);
+    const response = await agent.processQuery(task);
     console.log('\n📋 Final Response:');
     console.log(response.content);
     console.log(`\n✅ Tools used: ${response.toolsUsed.join(', ') || 'none'}`);
     console.log(`🧠 Memory retrieved: ${response.memoryRetrieved} entries`);
-    if (response.evaluationScore) {
-      console.log(`📊 Score: ${response.evaluationScore}/100`);
-    }
+    console.log(`📊 Score: ${response.evaluationScore}/100`);
 
     console.log('\n' + '='.repeat(80) + '\n');
 
